@@ -334,8 +334,12 @@ class SfacgOcrPlugin(private val activity: Activity) : Plugin(activity) {
         private val inputName = session.inputNames.single()
 
         /**
-         * Android ONNX Runtime 1.22 can abort in JNI while constructing model metadata.
          * Read the ONNX ModelProto metadata entry directly instead of calling session.metadata.
+         *
+         * onnxruntime 的 JNI 层按硬编码类名（ai/onnxruntime/OnnxModelMetadata 等）FindClass，
+         * 一旦这些类被 R8 改名或裁掉，进程会被 ART 直接 abort。app/proguard-rules.pro 已经
+         * 用 keep 规则保住整个 ai.onnxruntime 包，这里仍然直接解析 protobuf：少一次反射式
+         * 的元数据往返，也不依赖 ORT 的元数据 API。
          */
         private fun loadCharacterTable(file: File): List<String> {
             val characterText = BufferedInputStream(file.inputStream()).use { input ->

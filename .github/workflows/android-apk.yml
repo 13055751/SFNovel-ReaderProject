@@ -1,0 +1,157 @@
+name: Build Android APK
+
+# 手动触发，或在 main 分支上改动 Android / 前端 / 插件代码时自动触发。
+# 产出的是 release（R8 混淆）APK，用一次性测试签名，方便直接安装验证。
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/android-apk.yml"
+      - "package.json"
+      - "package-lock.json"
+      - "src/**"
+      - "src-tauri/gen/android/**"
+      - "src-tauri/src/**"
+
+permissions:
+  contents: read
+
+env:
+  OCR_MODEL_URL: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.2/onnx/PP-OCRv6/rec/PP-OCRv6_rec_small.onnx
+  OCR_MODEL_SHA256: 6f327246b50388f3c176ae304bd95767ea6dc0c9ae92153ef8cbe210b3c14884
+
+jobs:
+  android:
+    name: Build Android APK
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          sdkmanager "platforms;android-36" "build-tools;36.0.0"
+          sdkmanager "ndk;27.0.12077973" || echo "NDK 27.0.12077973 不可用，改用 runner 已安装的 NDK"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download OCR recognition model
+        shell: bash
+        run: |
+          model_path=src-tauri/resources/ocr-models/PP-OCRv6_rec_small.onnx
+          mkdir -p "$(dirname "$model_path")"
+          curl --fail --location --retry 3 --retry-all-errors --output "$model_path" "$OCR_MODEL_URL"
+          echo "$OCR_MODEL_SHA256  $model_path" | sha256sum --check --status
+
+      - name: Generate throwaway signing key
+        shell: bash
+        run: |
+          keytool -genkeypair -keystore src-tauri/gen/android/sf-novel-flow-test.jks \
+            -alias sf-novel-flow -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass androidtest -keypass androidtest \
+            -dname "CN=SF Novel Flow Test,O=Test,C=CN"
+          cat > src-tauri/gen/android/keystore.properties <<'EOF'
+          storeFile=sf-novel-flow-test.jks
+          storePassword=androidtest
+          keyAlias=sf-novel-flow
+          keyPassword=androidtest
+          EOF
+
+      - name: Build release APK (R8 minified)
+        run: npm run tauri:android:build -- --apk --target aarch64
+
+      - name: Verify ONNX Runtime classes survived R8
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import glob
+          import struct
+          import sys
+          import zipfile
+
+          apks = sorted(glob.glob("src-tauri/gen/android/app/build/outputs/apk/**/*.apk", recursive=True))
+          if not apks:
+              sys.exit("no APK found under src-tauri/gen/android/app/build/outputs/apk")
+
+          path = apks[0]
+          print("inspecting", path)
+
+          descriptors = []
+          with zipfile.ZipFile(path) as archive:
+              for name in archive.namelist():
+                  if not (name.startswith("classes") and name.endswith(".dex")):
+                      continue
+                  data = archive.read(name)
+                  string_ids_size, string_ids_off = struct.unpack_from("<II", data, 56)
+                  type_ids_size, type_ids_off = struct.unpack_from("<II", data, 64)
+
+                  def read_string(index):
+                      offset = struct.unpack_from("<I", data, string_ids_off + index * 4)[0]
+                      cursor = offset
+                      shift = 0
+                      length = 0
+                      while True:
+                          byte = data[cursor]
+                          cursor += 1
+                          length |= (byte & 0x7F) << shift
+                          if not byte & 0x80:
+                              break
+                          shift += 7
+                      return data[cursor:cursor + length].decode("utf-8", "replace")
+
+                  for index in range(type_ids_size):
+                      descriptors.append(read_string(struct.unpack_from("<I", data, type_ids_off + index * 4)[0]))
+
+          # 这些类由 onnxruntime 的 JNI 层按名字 FindClass，缺一个就会在 OCR 时 abort。
+          required = [
+              "Lai/onnxruntime/TensorInfo;",
+              "Lai/onnxruntime/NodeInfo;",
+              "Lai/onnxruntime/OnnxModelMetadata;",
+              "Lai/onnxruntime/MapInfo;",
+              "Lai/onnxruntime/SequenceInfo;",
+              "Lai/onnxruntime/OrtException;",
+              "Lai/onnxruntime/OnnxTensor;",
+              "Lai/onnxruntime/OrtSession;",
+          ]
+          missing = [name for name in required if name not in descriptors]
+          if missing:
+              print("R8 removed or renamed ONNX Runtime classes: " + ", ".join(missing))
+              sys.exit(1)
+          print("OK: all ONNX Runtime JNI classes kept")
+          PY
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: sf-novel-flow-android-apk
+          path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+
+      - name: Remove signing files
+        if: always()
+        shell: bash
+        run: rm -f src-tauri/gen/android/keystore.properties src-tauri/gen/android/sf-novel-flow-test.jks
