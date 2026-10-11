@@ -4,6 +4,9 @@ import android.app.Activity
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Movie
+import android.os.Build
+import android.system.Os
+import android.system.OsConstants
 import android.util.Log
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
@@ -17,6 +20,8 @@ import java.io.OutputStreamWriter
 import java.io.PrintWriter
 import java.nio.FloatBuffer
 import java.nio.charset.StandardCharsets
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
@@ -47,14 +52,21 @@ class SfacgOcrPlugin(private val activity: Activity) : Plugin(activity) {
             val progress = OcrProgress()
             var segments: File? = null
             try {
-                progress.stage = "检查输入文件"
                 val source = File(args.sourcePath)
+                OcrLog.attach(source.parentFile?.let { File(it, "ocr-log.txt") })
+                progress.to("检查输入文件")
                 require(source.isFile) { "OCR 输入图片不存在：${source.absolutePath}" }
+                OcrLog.line("开始识别：${source.absolutePath}（${source.length()} 字节，扩展名 ${source.extension}）")
+                OcrLog.line(
+                    "运行环境：${Build.MODEL} / Android ${Build.VERSION.RELEASE}（API ${Build.VERSION.SDK_INT}）" +
+                        " / 页大小 ${Os.sysconf(OsConstants._SC_PAGESIZE)} / ABI ${Build.SUPPORTED_ABIS.joinToString()}"
+                )
+                OcrLog.line("onnxruntime JNI 类自检：${onnxRuntimeJniClassReport()}")
                 val segmentDirectory = args.segmentsDir
                     ?.takeIf { it.isNotBlank() }
                     ?.let(::prepareSegmentsDirectory)
                 segments = segmentDirectory
-                progress.stage = "加载 OCR 模型"
+                progress.to("加载 OCR 模型")
                 val text = OnnxChapterRecognizer(activity).use { recognizer ->
                     recognizeFrames(source, segmentDirectory, recognizer, progress)
                 }
@@ -76,14 +88,14 @@ class SfacgOcrPlugin(private val activity: Activity) : Plugin(activity) {
     private fun recognizeFrames(source: File, segments: File?, recognizer: OnnxChapterRecognizer, progress: OcrProgress): String {
         val frameTexts = ArrayList<String>()
         if (source.extension.lowercase(Locale.ROOT) != "gif") {
-            progress.stage = "解码输入图片"
+            progress.to("解码输入图片")
             val bitmap = decodeMutableBitmap(source)
             try { frameTexts += recognizeBitmap(bitmap, segments, 1, recognizer, progress) }
             finally { bitmap.recycle() }
         } else {
             val movie = Movie.decodeFile(source.absolutePath)
             if (movie != null && movie.duration() <= 0) {
-                progress.stage = "解码 GIF 图片"
+                progress.to("解码 GIF 图片")
                 val bitmap = decodeMutableBitmap(source)
                 try { frameTexts += recognizeBitmap(bitmap, segments, 1, recognizer, progress) }
                 finally { bitmap.recycle() }
@@ -92,7 +104,7 @@ class SfacgOcrPlugin(private val activity: Activity) : Plugin(activity) {
                 try {
                     require(gif.numberOfFrames > 0) { "GIF 中不包含可识别帧" }
                     for (index in 0 until gif.numberOfFrames) {
-                        progress.stage = "解码 GIF 第 ${index + 1}/${gif.numberOfFrames} 帧"
+                        progress.to("解码 GIF 第 ${index + 1}/${gif.numberOfFrames} 帧")
                         gif.seekToFrame(index)
                         val frame = Bitmap.createBitmap(gif.intrinsicWidth, gif.intrinsicHeight, Bitmap.Config.ARGB_8888)
                         val canvas = android.graphics.Canvas(frame)
@@ -107,7 +119,7 @@ class SfacgOcrPlugin(private val activity: Activity) : Plugin(activity) {
         }
         return frameTexts.filter { it.isNotBlank() }.joinToString("\n\n").also {
             if (segments != null) {
-                progress.stage = "保存 OCR 结果"
+                progress.to("保存 OCR 结果")
                 saveText(it, File(segments, "ocr-result.txt"))
             }
         }
@@ -131,10 +143,10 @@ class SfacgOcrPlugin(private val activity: Activity) : Plugin(activity) {
 
     private fun recognizeBitmap(bitmap: Bitmap, segments: File?, frame: Int, recognizer: OnnxChapterRecognizer, progress: OcrProgress): String {
         // Keep only this cleaned page bitmap. Watermark buffers are bounded to a small row chunk.
-        progress.stage = "第 $frame 帧去水印"
+        progress.to("第 $frame 帧去水印")
         cleanWatermarkInPlace(bitmap)
         if (segments != null) {
-            progress.stage = "保存第 $frame 帧去水印图"
+            progress.to("保存第 $frame 帧去水印图")
             saveBitmapCopy(bitmap, File(segments, frameFileName(frame, "watermark-removed.png")))
         }
         return recognizeCleanedBitmap(bitmap, segments, frame, recognizer, progress)
@@ -243,13 +255,13 @@ class SfacgOcrPlugin(private val activity: Activity) : Plugin(activity) {
                 partNumber++
                 val prefix = "frame-${frame.toString().padStart(4, '0')}-line-${lineNumber.toString().padStart(4, '0')}-part-${partNumber.toString().padStart(4, '0')}"
                 if (segments != null) {
-                    progress.stage = "保存第 $frame 帧第 $lineNumber 行第 $partNumber 段"
+                    progress.to("保存第 $frame 帧第 $lineNumber 行第 $partNumber 段")
                     saveGray(line, File(segments, "$prefix.png"))
                 }
-                progress.stage = "识别第 $frame 帧第 $lineNumber 行第 $partNumber 段"
+                progress.to("识别第 $frame 帧第 $lineNumber 行第 $partNumber 段")
                 val value = recognizer.recognize(line)
                 if (segments != null) {
-                    progress.stage = "保存第 $frame 帧第 $lineNumber 行第 $partNumber 段识别结果"
+                    progress.to("保存第 $frame 帧第 $lineNumber 行第 $partNumber 段识别结果")
                     saveText(value, File(segments, "$prefix-ocr.txt"))
                 }
                 if (value.isNotEmpty()) texts += value
@@ -323,7 +335,13 @@ class SfacgOcrPlugin(private val activity: Activity) : Plugin(activity) {
         return "Android OCR 失败（阶段：$stage；异常：$causes）。${report?.let { "诊断报告：$it" } ?: "未能写入诊断报告"}"
     }
 
-    private class OcrProgress(var stage: String = "初始化")
+    private class OcrProgress(var stage: String = "初始化") {
+        /** 记录阶段变化：这份进度会同时写到 logcat 与章节 ocr 目录下的 ocr-log.txt。 */
+        fun to(next: String) {
+            stage = next
+            OcrLog.line("阶段：$next")
+        }
+    }
 
     private class OnnxChapterRecognizer(private val activity: Activity) : AutoCloseable {
         private val environment = OrtEnvironment.getEnvironment()
@@ -332,6 +350,12 @@ class SfacgOcrPlugin(private val activity: Activity) : Plugin(activity) {
         private val characters = loadCharacterTable(modelFile)
         private val session = environment.createSession(modelFile.absolutePath, sessionOptions)
         private val inputName = session.inputNames.single()
+        private var loggedFirstInference = false
+
+        init {
+            OcrLog.line("模型：${modelFile.absolutePath}（${modelFile.length()} 字节，字符表 ${characters.size} 项）")
+            OcrLog.line("推理会话已建立：输入名 ${inputName}，输出 ${session.outputNames}")
+        }
 
         /**
          * Read the ONNX ModelProto metadata entry directly instead of calling session.metadata.
@@ -461,6 +485,10 @@ class SfacgOcrPlugin(private val activity: Activity) : Plugin(activity) {
             require(shape.size == 3 && shape[0] == 1L) { "OCR 模型输出形状无效：${shape.contentToString()}" }
             val timeSteps = shape[1].toInt()
             val classCount = shape[2].toInt()
+            if (!loggedFirstInference) {
+                loggedFirstInference = true
+                OcrLog.line("首次推理输出形状：${timeSteps} x ${classCount}（字符表 ${characters.size} 项）")
+            }
             val scores = output.floatBuffer
             val text = StringBuilder(); var previous = -1
             for (step in 0 until timeSteps) {
@@ -514,3 +542,48 @@ class SfacgOcrPlugin(private val activity: Activity) : Plugin(activity) {
 }
 
 private inline fun Bitmap.useBitmap(block: (Bitmap) -> Unit) { try { block(this) } finally { recycle() } }
+
+/**
+ * OCR 运行时日志：每一步同时写 logcat（tag：SfacgOcr）和章节 ocr 目录下的 ocr-log.txt。
+ *
+ * 真机上 OCR 阶段的闪退可能发生在 JNI/ART 层，Java 侧 try/catch 抓不到，
+ * 日志会停在最后完成的那一步，用来定位崩溃位置。
+ */
+private object OcrLog {
+    private const val TAG = "SfacgOcr"
+    private val formatter = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
+
+    @Volatile
+    private var file: File? = null
+
+    /** 绑定日志文件；传 null 表示只写 logcat。 */
+    fun attach(target: File?) {
+        file = target?.also { it.parentFile?.mkdirs() }
+    }
+
+    @Synchronized
+    fun line(message: String) {
+        val text = "${formatter.format(Date())} $message"
+        Log.i(TAG, text)
+        val target = file ?: return
+        runCatching { target.appendText(text + "\n", Charsets.UTF_8) }
+    }
+}
+
+/**
+ * onnxruntime 的 JNI 层按硬编码类名 FindClass（见 app/proguard-rules.pro），
+ * 这些类一旦被 R8 改名或裁掉，OCR 会直接 abort 进程。这里做一次运行时自检。
+ */
+private val ORT_JNI_CLASSES = listOf(
+    "ai.onnxruntime.TensorInfo",
+    "ai.onnxruntime.NodeInfo",
+    "ai.onnxruntime.OnnxModelMetadata",
+    "ai.onnxruntime.MapInfo",
+    "ai.onnxruntime.SequenceInfo",
+    "ai.onnxruntime.OrtException",
+)
+
+private fun onnxRuntimeJniClassReport(): String = ORT_JNI_CLASSES.joinToString("；") { name ->
+    val present = runCatching { Class.forName(name) }.isSuccess
+    "${name.substringAfterLast('.')}=${if (present) "ok" else "缺失"}"
+}
